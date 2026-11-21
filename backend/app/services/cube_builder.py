@@ -8,8 +8,6 @@ from app.store import store
 from app.analytics_engine import (
     build_cube_cell,
     generate_dimension_combinations,
-    compute_metric,
-    AGGREGATORS,
 )
 
 
@@ -25,23 +23,45 @@ class CubeBuilderService(BaseModuleService):
 
     # ---- 业务方法 ----
 
-    def precompute_cube(self, cube_id: int, sample_data: list[dict[str, Any]]) -> dict[str, Any]:
-        """对指定立方执行预计算，按维度组合分组聚合。"""
-        cube = store.find(self.MODULE, cube_id)
-        if cube is None:
-            return {"ok": False, "message": f"立方 {cube_id} 不存在"}
-        dimensions = [d.strip() for d in str(cube.get("维度列表", "")).split(",") if d.strip()]
-        measures_raw = str(cube.get("预聚合度量", "")).split(",")
+    @staticmethod
+    def _parse_dimensions(cube: dict[str, Any]) -> list[str]:
+        return [d.strip() for d in str(cube.get("维度列表", "")).split(",") if d.strip()]
+
+    @staticmethod
+    def _parse_measures(cube: dict[str, Any]) -> list[dict[str, str]]:
         measures: list[dict[str, str]] = []
-        for m in measures_raw:
+        for m in str(cube.get("预聚合度量", "")).split(","):
             parts = m.strip().split(":")
             if len(parts) >= 2:
                 measures.append({"name": parts[0].strip(), "aggregator": parts[1].strip()})
             elif m.strip():
                 measures.append({"name": m.strip(), "aggregator": "SUM"})
+        return measures
+
+    @staticmethod
+    def _row_count_data(cells: list[Any]) -> dict[str, Any]:
+        """汇总一组立方单元格的行数数据：事实行总数、各度量明细行数、全空事实行数。"""
+        measure_row_counts: dict[str, int] = {}
+        for cell in cells:
+            for name, count in cell.measure_counts.items():
+                measure_row_counts[name] = measure_row_counts.get(name, 0) + count
+        return {
+            "fact_rows": sum(c.row_count for c in cells),
+            "measure_row_counts": measure_row_counts,
+            "empty_measure_rows": sum(c.empty_measure_rows for c in cells),
+        }
+
+    def precompute_cube(self, cube_id: int, sample_data: list[dict[str, Any]]) -> dict[str, Any]:
+        """对指定立方执行预计算，按维度组合分组聚合。"""
+        cube = store.find(self.MODULE, cube_id)
+        if cube is None:
+            return {"ok": False, "message": f"立方 {cube_id} 不存在"}
+        dimensions = self._parse_dimensions(cube)
+        measures = self._parse_measures(cube)
 
         cells = build_cube_cell(sample_data, dimensions, measures)
         dimension_combos = generate_dimension_combinations(dimensions)
+        row_count_data = self._row_count_data(cells)
 
         return {
             "ok": True,
@@ -50,15 +70,58 @@ class CubeBuilderService(BaseModuleService):
             "dimensions": dimensions,
             "dimension_combinations": len(dimension_combos),
             "cells": len(cells),
+            "fact_rows": row_count_data["fact_rows"],
+            "measure_row_counts": row_count_data["measure_row_counts"],
+            "empty_measure_rows": row_count_data["empty_measure_rows"],
             "cells_preview": [
                 {
                     "dimensions": c.dimensions,
                     "measures": c.measure_values,
                     "row_count": c.row_count,
+                    "measure_counts": c.measure_counts,
+                    "empty_measure_rows": c.empty_measure_rows,
                 }
                 for c in cells[:10]
             ],
             "storage_engine": cube.get("存储引擎"),
+        }
+
+    def cube_row_stats(
+        self, cube_name: str, rows: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """向切片查询交付立方行数数据。
+
+        按立方口径对给定的覆盖范围（同一批明细行）分组统计：
+        每个维组的事实行数、每个度量各自纳入的明细行数，以及
+        所有度量都缺失的全空事实行数，便于下游核对空度量行的归属。
+        """
+        cube = next(
+            (c for c in store.rows(self.MODULE) if c.get("立方名称") == cube_name),
+            None,
+        )
+        if cube is None:
+            return None
+        dimensions = self._parse_dimensions(cube)
+        measures = self._parse_measures(cube)
+        cells = build_cube_cell(rows, dimensions, measures)
+        row_count_data = self._row_count_data(cells)
+        return {
+            "cube_id": cube.get("id"),
+            "cube_name": str(cube.get("立方名称", "")),
+            "dimensions": dimensions,
+            "scope_rows": row_count_data["fact_rows"],
+            "fact_rows": row_count_data["fact_rows"],
+            "measure_row_counts": row_count_data["measure_row_counts"],
+            "empty_measure_rows": row_count_data["empty_measure_rows"],
+            "groups": [
+                {
+                    "dimensions": c.dimensions,
+                    "row_count": c.row_count,
+                    "measure_counts": c.measure_counts,
+                    "empty_measure_rows": c.empty_measure_rows,
+                }
+                for c in cells
+            ],
         }
 
     def get_cube_dimensions(self, cube_id: int) -> list[str]:
@@ -66,7 +129,7 @@ class CubeBuilderService(BaseModuleService):
         cube = store.find(self.MODULE, cube_id)
         if cube is None:
             return []
-        return [d.strip() for d in str(cube.get("维度列表", "")).split(",") if d.strip()]
+        return self._parse_dimensions(cube)
 
     def get_online_cubes(self) -> list[dict[str, Any]]:
         """获取所有已上线立方。"""

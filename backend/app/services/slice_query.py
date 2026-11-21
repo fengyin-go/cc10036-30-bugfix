@@ -69,7 +69,16 @@ class SliceQueryService(BaseModuleService):
         total = len(filtered)
         result = filtered[:row_limit]
 
-        return {
+        # 跨模块消费：向多维立方取行数数据，分组计数与切片明细用同一覆盖范围
+        cube_row_stats = None
+        cube_name = str(template.get("数据立方", "")).strip()
+        if cube_name:
+            from app.services import service_for
+            cube_svc = service_for("cube_builder")
+            if cube_svc is not None and hasattr(cube_svc, "cube_row_stats"):
+                cube_row_stats = cube_svc.cube_row_stats(cube_name, filtered)
+
+        response: dict[str, Any] = {
             "ok": True,
             "template_name": str(template.get("模板名称", "")),
             "result_rows": len(result),
@@ -78,6 +87,9 @@ class SliceQueryService(BaseModuleService):
             "cache_ttl": cache_ttl,
             "data": result,
         }
+        if cube_row_stats is not None:
+            response["cube_row_stats"] = cube_row_stats
+        return response
 
     def get_templates_for_cube(self, cube_name: str) -> list[dict[str, Any]]:
         """获取某立方关联的所有查询模板（供即席导出消费）。"""

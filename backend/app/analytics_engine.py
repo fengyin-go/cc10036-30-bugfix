@@ -54,7 +54,9 @@ class DimensionCombo:
     """维度组合记录。"""
     dimensions: list[str]
     measure_values: dict[str, float]
-    row_count: int = 0
+    row_count: int = 0  # 该维组的事实行数（按事实行计数，不按度量列估算）
+    measure_counts: dict[str, int] = field(default_factory=dict)  # 每个度量实际纳入的明细行数
+    empty_measure_rows: int = 0  # 所有度量都缺失的事实行数
 
 
 def build_cube_cell(
@@ -62,31 +64,56 @@ def build_cube_cell(
     dimensions: list[str],
     measures: list[dict[str, str]],  # [{"name": "revenue", "aggregator": "SUM"}, ...]
 ) -> list[DimensionCombo]:
-    """从原始数据构建多维立方单元格，按维度组合分组聚合度量。"""
-    group_map: dict[tuple[str, ...], dict[str, list[float | int]]] = {}
+    """从原始数据构建多维立方单元格，按维度组合分组聚合度量。
+
+    行数口径：row_count 按进入该维组的事实行计数，与切片明细行数对齐；
+    measure_counts 记录每个度量各自纳入了多少条有效明细（空值、无法解析
+    或非有限值不计入已计量）；所有度量都缺失的事实行计入 empty_measure_rows，
+    仍算在 row_count 内。合法零值（0 / 0.0 / "0"）视为已计量。
+    """
+    group_map: dict[tuple[str, ...], dict[str, Any]] = {}
     for row in raw_data:
         dim_key = tuple(str(row.get(d, "")) for d in dimensions)
-        if dim_key not in group_map:
-            group_map[dim_key] = {m["name"]: [] for m in measures}
+        bucket = group_map.get(dim_key)
+        if bucket is None:
+            bucket = {
+                "fact_rows": 0,
+                "values": {m["name"]: [] for m in measures},
+                "empty_rows": 0,
+            }
+            group_map[dim_key] = bucket
+        bucket["fact_rows"] += 1
+        row_has_measure = False
         for m in measures:
             val = row.get(m["name"])
-            if val is not None:
-                try:
-                    group_map[dim_key][m["name"]].append(float(val))
-                except (ValueError, TypeError):
-                    pass
+            if val is None:
+                continue
+            try:
+                num_val = float(val)
+            except (ValueError, TypeError):
+                continue  # 无效值不计入已计量，重试取数也不会被当作已计量
+            if not math.isfinite(num_val):
+                continue  # NaN/Inf 属于无效值，不得显示成已计量
+            bucket["values"][m["name"]].append(num_val)
+            row_has_measure = True
+        if not row_has_measure:
+            bucket["empty_rows"] += 1
 
     results: list[DimensionCombo] = []
-    for dim_key, measure_data in group_map.items():
+    for dim_key, bucket in group_map.items():
+        values_map: dict[str, list[float | int]] = bucket["values"]
         measure_values: dict[str, float] = {}
-        total_rows = max(len(v) for v in measure_data.values()) if measure_data else 0
+        measure_counts: dict[str, int] = {}
         for m in measures:
-            values = measure_data.get(m["name"], [])
+            values = values_map.get(m["name"], [])
             measure_values[m["name"]] = compute_metric(values, m["aggregator"])
+            measure_counts[m["name"]] = len(values)
         results.append(DimensionCombo(
             dimensions=list(dim_key),
             measure_values=measure_values,
-            row_count=total_rows,
+            row_count=bucket["fact_rows"],
+            measure_counts=measure_counts,
+            empty_measure_rows=bucket["empty_rows"],
         ))
     return results
 
